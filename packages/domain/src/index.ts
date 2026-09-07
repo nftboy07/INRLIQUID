@@ -5,37 +5,20 @@ export const sideSchema = z.enum(['BUY', 'SELL']);
 export const orderTypeSchema = z.enum(['MARKET', 'LIMIT', 'STOP_MARKET', 'STOP_LIMIT', 'TAKE_MARKET', 'TAKE_LIMIT', 'SCALE', 'TWAP']);
 export const timeInForceSchema = z.enum(['GTC', 'IOC', 'ALO']);
 export const triggerKindSchema = z.enum(['TP', 'SL']);
+export const paymentMethodSchema = z.enum(['RAZORPAY_UPI', 'STRIPE_CARD', 'STRIPE_UPI', 'STRIPE_CRYPTO']);
 
 const baseOrderSchema = z.object({
-  symbol: z.string().trim().toUpperCase().min(1).max(30),
-  exchange: exchangeSchema.default('NSE'),
-  side: sideSchema,
-  quantity: z.number().int().positive(),
-  reduceOnly: z.boolean().default(false),
-  timeInForce: timeInForceSchema.default('GTC'),
-  clientOrderId: z.string().trim().min(8).max(128).optional(),
-  idempotencyKey: z.string().trim().min(16).max(128),
-  limitPriceInr: z.number().positive().optional(),
-  triggerPriceInr: z.number().positive().optional(),
-  triggerKind: triggerKindSchema.optional(),
-  parentOrderId: z.string().trim().min(1).max(128).optional(),
-  ocoGroupId: z.string().trim().min(1).max(128).optional(),
-  postOnly: z.boolean().default(false)
+  symbol: z.string().trim().toUpperCase().min(1).max(30), exchange: exchangeSchema.default('NSE'), side: sideSchema, quantity: z.number().int().positive(),
+  reduceOnly: z.boolean().default(false), timeInForce: timeInForceSchema.default('GTC'), clientOrderId: z.string().trim().min(8).max(128).optional(),
+  idempotencyKey: z.string().trim().min(16).max(128), limitPriceInr: z.number().positive().optional(), triggerPriceInr: z.number().positive().optional(),
+  triggerKind: triggerKindSchema.optional(), parentOrderId: z.string().trim().min(1).max(128).optional(), ocoGroupId: z.string().trim().min(1).max(128).optional(), postOnly: z.boolean().default(false)
 });
 
 export const createOrderRequestSchema = baseOrderSchema.extend({
-  orderType: orderTypeSchema.default('MARKET'),
-  scale: z.object({
-    levels: z.number().int().min(2).max(100),
-    endPriceInr: z.number().positive()
-  }).optional(),
-  twap: z.object({
-    durationMinutes: z.number().int().min(1).max(1440),
-    randomize: z.boolean().default(false)
-  }).optional()
+  orderType: orderTypeSchema.default('MARKET'), scale: z.object({ levels: z.number().int().min(2).max(100), endPriceInr: z.number().positive() }).optional(),
+  twap: z.object({ durationMinutes: z.number().int().min(1).max(1440), randomize: z.boolean().default(false) }).optional()
 }).superRefine((value, ctx) => {
-  const needsLimit = ['LIMIT', 'STOP_LIMIT', 'TAKE_LIMIT'].includes(value.orderType);
-  const needsTrigger = ['STOP_MARKET', 'STOP_LIMIT', 'TAKE_MARKET', 'TAKE_LIMIT'].includes(value.orderType);
+  const needsLimit = ['LIMIT', 'STOP_LIMIT', 'TAKE_LIMIT'].includes(value.orderType), needsTrigger = ['STOP_MARKET', 'STOP_LIMIT', 'TAKE_MARKET', 'TAKE_LIMIT'].includes(value.orderType);
   if (needsLimit && value.limitPriceInr === undefined) ctx.addIssue({ code: 'custom', path: ['limitPriceInr'], message: 'Limit price is required' });
   if (!needsLimit && value.limitPriceInr !== undefined) ctx.addIssue({ code: 'custom', path: ['limitPriceInr'], message: 'Limit price is not valid for this order type' });
   if (needsTrigger && value.triggerPriceInr === undefined) ctx.addIssue({ code: 'custom', path: ['triggerPriceInr'], message: 'Trigger price is required' });
@@ -48,36 +31,13 @@ export const createOrderRequestSchema = baseOrderSchema.extend({
   if (value.orderType === 'MARKET' && value.timeInForce === 'ALO') ctx.addIssue({ code: 'custom', path: ['timeInForce'], message: 'Market orders cannot be post-only' });
 });
 
-export const createTpSlRequestSchema = z.object({
-  symbol: z.string().trim().toUpperCase().min(1).max(30),
-  exchange: exchangeSchema.default('NSE'),
-  side: sideSchema,
-  quantity: z.number().int().positive(),
-  triggerPriceInr: z.number().positive(),
-  limitPriceInr: z.number().positive().optional(),
-  kind: triggerKindSchema,
-  market: z.boolean().default(true),
-  reduceOnly: z.literal(true).default(true),
-  parentOrderId: z.string().trim().min(1).max(128).optional(),
-  ocoGroupId: z.string().trim().min(1).max(128).optional(),
-  idempotencyKey: z.string().trim().min(16).max(128)
-}).superRefine((value, ctx) => {
-  if (!value.market && value.limitPriceInr === undefined) ctx.addIssue({ code: 'custom', path: ['limitPriceInr'], message: 'Limit price is required for limit TP/SL' });
-  if (value.market && value.limitPriceInr !== undefined) ctx.addIssue({ code: 'custom', path: ['limitPriceInr'], message: 'Market TP/SL cannot include a limit price' });
-});
+export const createTpSlRequestSchema = z.object({ symbol: z.string().trim().toUpperCase().min(1).max(30), exchange: exchangeSchema.default('NSE'), side: sideSchema, quantity: z.number().int().positive(), triggerPriceInr: z.number().positive(), limitPriceInr: z.number().positive().optional(), kind: triggerKindSchema, market: z.boolean().default(true), reduceOnly: z.literal(true).default(true), parentOrderId: z.string().trim().min(1).max(128).optional(), ocoGroupId: z.string().trim().min(1).max(128).optional(), idempotencyKey: z.string().trim().min(16).max(128) }).superRefine((value, ctx) => { if (!value.market && value.limitPriceInr === undefined) ctx.addIssue({ code: 'custom', path: ['limitPriceInr'], message: 'Limit price is required for limit TP/SL' }); if (value.market && value.limitPriceInr !== undefined) ctx.addIssue({ code: 'custom', path: ['limitPriceInr'], message: 'Market TP/SL cannot include a limit price' }); });
 
-export const createPaymentIntentSchema = z.object({
-  amountInr: z.number().positive().finite(),
-  purpose: z.enum(['TRADING_FUNDING', 'WITHDRAWAL', 'SETTLEMENT', 'FEES']),
-  idempotencyKey: z.string().trim().min(16).max(128)
-});
+export const createPaymentIntentSchema = z.object({ amountInr: z.number().positive().finite(), purpose: z.enum(['TRADING_FUNDING', 'WITHDRAWAL', 'SETTLEMENT', 'FEES']), idempotencyKey: z.string().trim().min(16).max(128) });
+export const createCardOrUpiPaymentSchema = createPaymentIntentSchema.extend({ method: z.enum(['STRIPE_CARD', 'STRIPE_UPI']) });
+export const createCryptoPaymentSchema = z.object({ amountUsd: z.number().positive().finite(), targetInr: z.number().positive().finite(), idempotencyKey: z.string().trim().min(16).max(128), asset: z.string().trim().toUpperCase().min(2).max(20).default('USDC'), network: z.string().trim().min(2).max(30).default('BASE') });
 
-export type CreateOrderRequest = z.infer<typeof createOrderRequestSchema>;
-export type CreateTpSlRequest = z.infer<typeof createTpSlRequestSchema>;
-export type CreatePaymentIntent = z.infer<typeof createPaymentIntentSchema>;
-export type OrderType = z.infer<typeof orderTypeSchema>;
-export type TimeInForce = z.infer<typeof timeInForceSchema>;
-
+export type CreateOrderRequest = z.infer<typeof createOrderRequestSchema>; export type CreateTpSlRequest = z.infer<typeof createTpSlRequestSchema>; export type CreatePaymentIntent = z.infer<typeof createPaymentIntentSchema>; export type CreateCardOrUpiPayment = z.infer<typeof createCardOrUpiPaymentSchema>; export type CreateCryptoPayment = z.infer<typeof createCryptoPaymentSchema>; export type OrderType = z.infer<typeof orderTypeSchema>; export type TimeInForce = z.infer<typeof timeInForceSchema>; export type PaymentMethod = z.infer<typeof paymentMethodSchema>;
 export interface Quote { symbol: string; exchange: 'NSE' | 'BSE'; lastPriceInr: number; bestBidInr?: number; bestAskInr?: number; asOf: string; }
 export interface OrderBookLevel { priceInr: number; quantity: number; orders?: number; }
 export interface OrderBook { symbol: string; exchange: 'NSE' | 'BSE'; bids: OrderBookLevel[]; asks: OrderBookLevel[]; asOf: string; }
