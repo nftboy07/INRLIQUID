@@ -1,0 +1,70 @@
+openapi: 3.0.3
+info:
+  title: INRLIQUID API
+  version: 0.1.0
+  description: API contract for Indian-market trading infrastructure.
+servers:
+  - url: http://localhost:3001
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service is healthy
+  /v1/market/{exchange}/{symbol}/quote:
+    get:
+      summary: Latest quote
+      parameters:
+        - {name: exchange, in: path, required: true, schema: {type: string, enum: [NSE, BSE]}}
+        - {name: symbol, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: Provider quote}
+        '503': {description: Market data provider unavailable}
+  /v1/orders:
+    post:
+      summary: Submit a live order
+      description: Fails closed unless a configured live execution provider accepts the order.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201': {description: Order accepted by execution provider}
+        '400': {description: Invalid order}
+        '503': {description: Live execution unavailable}
+  /v1/payments/upi/intents:
+    post:
+      summary: Create a UPI payment intent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentIntentRequest'
+      responses:
+        '201': {description: Payment intent created}
+        '400': {description: Invalid payment request}
+        '503': {description: UPI provider unavailable}
+components:
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required: [clientOrderId, exchange, symbol, side, orderType, quantity]
+      properties:
+        clientOrderId: {type: string, minLength: 16, maxLength: 128}
+        exchange: {type: string, enum: [NSE, BSE]}
+        symbol: {type: string, minLength: 1, maxLength: 30}
+        side: {type: string, enum: [BUY, SELL]}
+        orderType: {type: string, enum: [MARKET, LIMIT]}
+        quantity: {type: number, exclusiveMinimum: 0}
+        limitPriceInr: {type: number, exclusiveMinimum: 0}
+    PaymentIntentRequest:
+      type: object
+      required: [amountInr, purpose, idempotencyKey]
+      properties:
+        amountInr: {type: number, exclusiveMinimum: 0}
+        purpose: {type: string, enum: [TRADING_FUNDING, SETTLEMENT]}
+        idempotencyKey: {type: string, minLength: 16, maxLength: 128}
