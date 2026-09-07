@@ -1,4 +1,6 @@
 import Fastify from 'fastify';
+import rawBody from 'fastify-raw-body';
+import { createHmac, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { z } from 'zod';
 import { createOrderRequestSchema, createPaymentIntentSchema, createTpSlRequestSchema, type BrokerAdapter, type MarketDataAdapter, type UpiAdapter } from '@inrliquid/domain';
@@ -6,14 +8,13 @@ import { RazorpayUpiAdapter, createRazorpayPayout } from '@inrliquid/adapters';
 import { createDeposit, createWithdrawal, getWallet } from './wallet.js';
 
 const app = Fastify({ logger: true });
+await app.register(rawBody, { field: 'rawBody', global: false, encoding: 'utf8', runFirst: true });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const unavailable = (name: string) => new Error(`${name} provider is not configured for live operation`);
 const razorpayConfigured = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
 const razorpay = razorpayConfigured ? new RazorpayUpiAdapter({
-  keyId: process.env.RAZORPAY_KEY_ID!,
-  keySecret: process.env.RAZORPAY_KEY_SECRET!,
-  apiBaseUrl: process.env.RAZORPAY_API_BASE_URL,
-  payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER
+  keyId: process.env.RAZORPAY_KEY_ID!, keySecret: process.env.RAZORPAY_KEY_SECRET!,
+  apiBaseUrl: process.env.RAZORPAY_API_BASE_URL, payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER
 }) : null;
 
 const broker: BrokerAdapter = {
@@ -33,81 +34,93 @@ function userId(request: { headers: Record<string, string | string[] | undefined
   return id;
 }
 
+function verifyWebhook(raw: string, signature: string | undefined) {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!secret || !signature) return false;
+  const expected = createHmac('sha256', secret).update(raw, 'utf8').digest('hex');
+  return signature.length === expected.length && createHmac('sha256', expected).update(signature).digest('hex') === createHmac('sha256', signature).update(expected).digest('hex');
+}
+
 app.get('/health', async () => ({ status: 'ok', service: 'inrliquid-api', providers: { razorpay: razorpayConfigured } }));
+
+app.post('/v1/webhooks/razorpay', { config: { rawBody: true } }, async (request, reply) => {
+  const raw = String((request as typeof request & { rawBody?: string }).rawBody ?? '');
+  if (!verifyWebhook(raw, request.headers['x-razorpay-signature'] as string | undefined)) return reply.code(401).send({ error: 'INVALID_WEBHOOK_SIGNATURE' });
+  const payload = JSON.parse(raw) as Record<string, any>;
+  const eventId = String(payload.id ?? randomUUID());
+  const eventType = String(payload.event ?? 'unknown');
+  const inserted = await pool.query(
+    `INSERT INTO payment_webhook_events (event_id, provider, event_type, payload) VALUES ($1,'razorpay',$2,$3) ON CONFLICT (event_id) DO NOTHING`,
+    [eventId, eventType, payload]
+  );
+  if (!inserted.rowCount) return reply.send({ ok: true, duplicate: true });
+
+  const paymentId = payload.payload?.payment_link?.entity?.id;
+  const paymentAmount = Number(payload.payload?.payment_link?.entity?.amount ?? 0);
+  if (eventType === 'payment_link.paid' && paymentId) {
+    const tx = await pool.query(`SELECT * FROM wallet_transactions WHERE provider = 'razorpay' AND provider_transaction_id = $1 FOR UPDATE`, [paymentId]);
+    if (tx.rows[0] && tx.rows[0].status === 'PENDING') {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const locked = await client.query(`SELECT * FROM wallet_transactions WHERE id = $1 FOR UPDATE`, [tx.rows[0].id]);
+        if (locked.rows[0]?.status === 'PENDING') {
+          await client.query(`UPDATE wallet_transactions SET status='COMPLETED', completed_at=now() WHERE id=$1`, [tx.rows[0].id]);
+          await client.query(`UPDATE wallet_accounts SET available_paise=available_paise+$1, updated_at=now() WHERE id=$2`, [paymentAmount, tx.rows[0].wallet_id]);
+        }
+        await client.query('COMMIT');
+      } finally { client.release(); }
+    }
+  }
+  if (eventType === 'payout.processed' || eventType === 'payout.failed' || eventType === 'payout.reversed') {
+    const payoutId = payload.payload?.payout?.entity?.id;
+    if (payoutId) {
+      const status = eventType === 'payout.processed' ? 'COMPLETED' : 'FAILED';
+      const tx = await pool.query(`SELECT * FROM wallet_transactions WHERE provider='razorpayx' AND provider_transaction_id=$1`, [payoutId]);
+      if (tx.rows[0]) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const locked = await client.query(`SELECT * FROM wallet_transactions WHERE id=$1 FOR UPDATE`, [tx.rows[0].id]);
+          if (locked.rows[0]?.status === 'PENDING') {
+            await client.query(`UPDATE wallet_transactions SET status=$1, completed_at=CASE WHEN $1='COMPLETED' THEN now() ELSE NULL END WHERE id=$2`, [status, tx.rows[0].id]);
+            if (status === 'COMPLETED') await client.query(`UPDATE wallet_accounts SET locked_paise=locked_paise-$1, updated_at=now() WHERE id=$2`, [tx.rows[0].amount_paise, tx.rows[0].wallet_id]);
+            else await client.query(`UPDATE wallet_accounts SET locked_paise=locked_paise-$1, available_paise=available_paise+$1, updated_at=now() WHERE id=$2`, [tx.rows[0].amount_paise, tx.rows[0].wallet_id]);
+          }
+          await client.query('COMMIT');
+        } finally { client.release(); }
+      }
+    }
+  }
+  await pool.query(`UPDATE payment_webhook_events SET processed_at=now() WHERE event_id=$1`, [eventId]);
+  return reply.send({ ok: true });
+});
 
 app.get('/v1/wallet', async (request, reply) => {
   try { return await getWallet(pool, userId(request)); }
   catch (error) { return reply.code(401).send({ error: String(error) }); }
 });
-
 app.post('/v1/wallet/deposits', async (request, reply) => {
   const parsed = z.object({ amountInr: z.number().positive().finite(), idempotencyKey: z.string().min(16).max(128) }).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'INVALID_DEPOSIT', issues: parsed.error.issues });
-  try {
-    if (!razorpay) throw unavailable('Razorpay');
-    return reply.code(201).send(await createDeposit(pool, { userId: userId(request) }, parsed.data.amountInr, parsed.data.idempotencyKey, razorpay));
-  } catch (error) { return reply.code(503).send({ error: 'DEPOSIT_UNAVAILABLE', message: String(error) }); }
+  try { if (!razorpay) throw unavailable('Razorpay'); return reply.code(201).send(await createDeposit(pool, { userId: userId(request) }, parsed.data.amountInr, parsed.data.idempotencyKey, razorpay)); }
+  catch (error) { return reply.code(503).send({ error: 'DEPOSIT_UNAVAILABLE', message: String(error) }); }
 });
-
 app.post('/v1/wallet/withdrawals', async (request, reply) => {
-  const parsed = z.object({
-    amountInr: z.number().positive().finite(), fundAccountId: z.string().min(1),
-    mode: z.enum(['UPI','IMPS','NEFT','RTGS']).default('UPI'), idempotencyKey: z.string().min(16).max(128)
-  }).safeParse(request.body);
+  const parsed = z.object({ amountInr: z.number().positive().finite(), fundAccountId: z.string().min(1), mode: z.enum(['UPI','IMPS','NEFT','RTGS']).default('UPI'), idempotencyKey: z.string().min(16).max(128) }).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'INVALID_WITHDRAWAL', issues: parsed.error.issues });
   try {
     if (!razorpay) throw unavailable('RazorpayX');
-    return reply.code(201).send(await createWithdrawal(pool, { userId: userId(request) }, parsed.data.amountInr, parsed.data.fundAccountId, parsed.data.mode, parsed.data.idempotencyKey, {
-      keyId: process.env.RAZORPAY_KEY_ID!, keySecret: process.env.RAZORPAY_KEY_SECRET!, apiBaseUrl: process.env.RAZORPAY_API_BASE_URL,
-      payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER
-    }));
+    return reply.code(201).send(await createWithdrawal(pool, { userId: userId(request) }, parsed.data.amountInr, parsed.data.fundAccountId, parsed.data.mode, parsed.data.idempotencyKey, { keyId: process.env.RAZORPAY_KEY_ID!, keySecret: process.env.RAZORPAY_KEY_SECRET!, apiBaseUrl: process.env.RAZORPAY_API_BASE_URL, payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER }));
   } catch (error) { return reply.code(503).send({ error: 'WITHDRAWAL_UNAVAILABLE', message: String(error) }); }
 });
 
-app.get('/v1/market/:exchange/:symbol/quote', async (request, reply) => {
-  const params = z.object({ exchange: z.enum(['NSE', 'BSE']), symbol: z.string().min(1).max(30) }).parse(request.params);
-  try { return await marketData.quote(params.symbol.toUpperCase(), params.exchange); }
-  catch (error) { return reply.code(503).send({ error: 'MARKET_DATA_UNAVAILABLE', message: String(error) }); }
-});
-app.get('/v1/market/:exchange/:symbol/orderbook', async (request, reply) => {
-  const params = z.object({ exchange: z.enum(['NSE', 'BSE']), symbol: z.string().min(1).max(30) }).parse(request.params);
-  try { return await marketData.orderBook(params.symbol.toUpperCase(), params.exchange); }
-  catch (error) { return reply.code(503).send({ error: 'ORDERBOOK_UNAVAILABLE', message: String(error) }); }
-});
-app.post('/v1/orders', async (request, reply) => {
-  const parsed = createOrderRequestSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_ORDER', issues: parsed.error.issues });
-  try { return reply.code(201).send(await broker.placeOrder(parsed.data)); }
-  catch (error) { return reply.code(503).send({ error: 'EXECUTION_UNAVAILABLE', message: String(error) }); }
-});
-app.post('/v1/orders/tpsl', async (request, reply) => {
-  const parsed = createTpSlRequestSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_TPSL', issues: parsed.error.issues });
-  try { return reply.code(201).send(await broker.placeTpSl(parsed.data)); }
-  catch (error) { return reply.code(503).send({ error: 'EXECUTION_UNAVAILABLE', message: String(error) }); }
-});
-app.patch('/v1/orders/:orderId', async (request, reply) => {
-  const orderId = z.string().min(1).parse((request.params as { orderId: string }).orderId);
-  const parsed = createOrderRequestSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_ORDER', issues: parsed.error.issues });
-  try { return reply.send(await broker.modifyOrder(orderId, parsed.data)); }
-  catch (error) { return reply.code(503).send({ error: 'EXECUTION_UNAVAILABLE', message: String(error) }); }
-});
-app.delete('/v1/orders/:orderId', async (request, reply) => {
-  const orderId = z.string().min(1).parse((request.params as { orderId: string }).orderId);
-  try { await broker.cancelOrder(orderId); return reply.code(204).send(); }
-  catch (error) { return reply.code(503).send({ error: 'EXECUTION_UNAVAILABLE', message: String(error) }); }
-});
-app.post('/v1/payments/upi/intents', async (request, reply) => {
-  const parsed = createPaymentIntentSchema.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_PAYMENT', issues: parsed.error.issues });
-  try { return reply.code(201).send(await upi.createPaymentIntent(parsed.data)); }
-  catch (error) { return reply.code(503).send({ error: 'UPI_UNAVAILABLE', message: String(error) }); }
-});
-app.delete('/v1/payments/upi/intents/:paymentId', async (request, reply) => {
-  const paymentId = z.string().min(1).parse((request.params as { paymentId: string }).paymentId);
-  try { await upi.cancelPaymentIntent(paymentId); return reply.code(204).send(); }
-  catch (error) { return reply.code(503).send({ error: 'UPI_UNAVAILABLE', message: String(error) }); }
-});
-
-await app.listen({ port: Number(process.env.PORT ?? 3001), host: '0.0.0.0' });
+app.get('/v1/market/:exchange/:symbol/quote', async (request, reply) => { const p=z.object({exchange:z.enum(['NSE','BSE']),symbol:z.string().min(1).max(30)}).parse(request.params); try{return await marketData.quote(p.symbol.toUpperCase(),p.exchange)}catch(e){return reply.code(503).send({error:'MARKET_DATA_UNAVAILABLE',message:String(e)})} });
+app.get('/v1/market/:exchange/:symbol/orderbook', async (request, reply) => { const p=z.object({exchange:z.enum(['NSE','BSE']),symbol:z.string().min(1).max(30)}).parse(request.params); try{return await marketData.orderBook(p.symbol.toUpperCase(),p.exchange)}catch(e){return reply.code(503).send({error:'ORDERBOOK_UNAVAILABLE',message:String(e)})} });
+app.post('/v1/orders', async (request, reply) => { const p=createOrderRequestSchema.safeParse(request.body); if(!p.success)return reply.code(400).send({error:'INVALID_ORDER',issues:p.error.issues}); try{return reply.code(201).send(await broker.placeOrder(p.data))}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})} });
+app.post('/v1/orders/tpsl', async (request, reply) => { const p=createTpSlRequestSchema.safeParse(request.body); if(!p.success)return reply.code(400).send({error:'INVALID_TPSL',issues:p.error.issues}); try{return reply.code(201).send(await broker.placeTpSl(p.data))}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})} });
+app.patch('/v1/orders/:orderId', async (request, reply) => { const orderId=z.string().min(1).parse((request.params as {orderId:string}).orderId); const p=createOrderRequestSchema.safeParse(request.body); if(!p.success)return reply.code(400).send({error:'INVALID_ORDER',issues:p.error.issues}); try{return reply.send(await broker.modifyOrder(orderId,p.data))}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})} });
+app.delete('/v1/orders/:orderId', async (request, reply) => { const orderId=z.string().min(1).parse((request.params as {orderId:string}).orderId); try{await broker.cancelOrder(orderId);return reply.code(204).send()}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})} });
+app.post('/v1/payments/upi/intents', async (request, reply) => { const p=createPaymentIntentSchema.safeParse(request.body); if(!p.success)return reply.code(400).send({error:'INVALID_PAYMENT',issues:p.error.issues}); try{return reply.code(201).send(await upi.createPaymentIntent(p.data))}catch(e){return reply.code(503).send({error:'UPI_UNAVAILABLE',message:String(e)})} });
+app.delete('/v1/payments/upi/intents/:paymentId', async (request, reply) => { const paymentId=z.string().min(1).parse((request.params as {paymentId:string}).paymentId); try{await upi.cancelPaymentIntent(paymentId);return reply.code(204).send()}catch(e){return reply.code(503).send({error:'UPI_UNAVAILABLE',message:String(e)})} });
+await app.listen({ port:Number(process.env.PORT??3001), host:'0.0.0.0' });
