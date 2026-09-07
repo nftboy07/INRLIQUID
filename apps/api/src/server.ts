@@ -1,26 +1,69 @@
 import Fastify from 'fastify';
+import { Pool } from 'pg';
 import { z } from 'zod';
 import { createOrderRequestSchema, createPaymentIntentSchema, createTpSlRequestSchema, type BrokerAdapter, type MarketDataAdapter, type UpiAdapter } from '@inrliquid/domain';
+import { RazorpayUpiAdapter, createRazorpayPayout } from '@inrliquid/adapters';
+import { createDeposit, createWithdrawal, getWallet } from './wallet.js';
 
 const app = Fastify({ logger: true });
-
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const unavailable = (name: string) => new Error(`${name} provider is not configured for live operation`);
+const razorpayConfigured = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+const razorpay = razorpayConfigured ? new RazorpayUpiAdapter({
+  keyId: process.env.RAZORPAY_KEY_ID!,
+  keySecret: process.env.RAZORPAY_KEY_SECRET!,
+  apiBaseUrl: process.env.RAZORPAY_API_BASE_URL,
+  payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER
+}) : null;
+
 const broker: BrokerAdapter = {
-  async placeOrder() { throw unavailable('Broker'); },
-  async placeTpSl() { throw unavailable('Broker'); },
-  async cancelOrder() { throw unavailable('Broker'); },
-  async modifyOrder() { throw unavailable('Broker'); }
+  async placeOrder() { throw unavailable('Broker'); }, async placeTpSl() { throw unavailable('Broker'); },
+  async cancelOrder() { throw unavailable('Broker'); }, async modifyOrder() { throw unavailable('Broker'); }
 };
 const marketData: MarketDataAdapter = {
-  async quote() { throw unavailable('Market-data'); },
-  async orderBook() { throw unavailable('Market-data'); }
+  async quote() { throw unavailable('Market-data'); }, async orderBook() { throw unavailable('Market-data'); }
 };
-const upi: UpiAdapter = {
-  async createPaymentIntent() { throw unavailable('UPI'); },
-  async cancelPaymentIntent() { throw unavailable('UPI'); }
+const upi: UpiAdapter = razorpay ?? {
+  async createPaymentIntent() { throw unavailable('UPI'); }, async cancelPaymentIntent() { throw unavailable('UPI'); }
 };
 
-app.get('/health', async () => ({ status: 'ok', service: 'inrliquid-api' }));
+function userId(request: { headers: Record<string, string | string[] | undefined> }) {
+  const id = request.headers['x-user-id'];
+  if (typeof id !== 'string' || !z.string().uuid().safeParse(id).success) throw new Error('AUTH_REQUIRED');
+  return id;
+}
+
+app.get('/health', async () => ({ status: 'ok', service: 'inrliquid-api', providers: { razorpay: razorpayConfigured } }));
+
+app.get('/v1/wallet', async (request, reply) => {
+  try { return await getWallet(pool, userId(request)); }
+  catch (error) { return reply.code(401).send({ error: String(error) }); }
+});
+
+app.post('/v1/wallet/deposits', async (request, reply) => {
+  const parsed = z.object({ amountInr: z.number().positive().finite(), idempotencyKey: z.string().min(16).max(128) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_DEPOSIT', issues: parsed.error.issues });
+  try {
+    if (!razorpay) throw unavailable('Razorpay');
+    return reply.code(201).send(await createDeposit(pool, { userId: userId(request) }, parsed.data.amountInr, parsed.data.idempotencyKey, razorpay));
+  } catch (error) { return reply.code(503).send({ error: 'DEPOSIT_UNAVAILABLE', message: String(error) }); }
+});
+
+app.post('/v1/wallet/withdrawals', async (request, reply) => {
+  const parsed = z.object({
+    amountInr: z.number().positive().finite(), fundAccountId: z.string().min(1),
+    mode: z.enum(['UPI','IMPS','NEFT','RTGS']).default('UPI'), idempotencyKey: z.string().min(16).max(128)
+  }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'INVALID_WITHDRAWAL', issues: parsed.error.issues });
+  try {
+    if (!razorpay) throw unavailable('RazorpayX');
+    return reply.code(201).send(await createWithdrawal(pool, { userId: userId(request) }, parsed.data.amountInr, parsed.data.fundAccountId, parsed.data.mode, parsed.data.idempotencyKey, {
+      keyId: process.env.RAZORPAY_KEY_ID!, keySecret: process.env.RAZORPAY_KEY_SECRET!, apiBaseUrl: process.env.RAZORPAY_API_BASE_URL,
+      payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER
+    }));
+  } catch (error) { return reply.code(503).send({ error: 'WITHDRAWAL_UNAVAILABLE', message: String(error) }); }
+});
+
 app.get('/v1/market/:exchange/:symbol/quote', async (request, reply) => {
   const params = z.object({ exchange: z.enum(['NSE', 'BSE']), symbol: z.string().min(1).max(30) }).parse(request.params);
   try { return await marketData.quote(params.symbol.toUpperCase(), params.exchange); }
