@@ -1,0 +1,1 @@
+export const INRLIQUID_BRAND = 'INRLIQUID';
