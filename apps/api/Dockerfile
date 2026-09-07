@@ -24,4 +24,4 @@ COPY --from=build /app/infra/sql infra/sql
 RUN pnpm install --prod --frozen-lockfile
 USER node
 EXPOSE 3001
-CMD ["node","apps/api/dist/migrate.js"]
+CMD ["sh","-c","node apps/api/dist/migrate.js && node apps/api/dist/server.js"]
