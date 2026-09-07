@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: inrliquid
+      POSTGRES_USER: inrliquid
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inrliquid -d inrliquid"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env.production
+    environment:
+      DATABASE_URL: postgresql://inrliquid:${POSTGRES_PASSWORD}@postgres:5432/inrliquid
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      ALLOW_DEV_USER_HEADER: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+
+volumes:
+  postgres-data:
