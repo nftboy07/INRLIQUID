@@ -2,30 +2,37 @@
 
 Indian-market trading infrastructure with a fast, exchange-style UX and real integration boundaries.
 
-## Product direction
+## Trading surface
 
-INRLIQUID is designed around three principles:
+INRLIQUID now models a Hyperliquid-style trading terminal for Indian cash equities: market and limit orders, GTC/IOC/ALO time-in-force, post-only, reduce-only, stop-market, stop-limit, take-market, take-limit, TP/SL, parent-linked OCO semantics, scale orders, TWAP configuration, amend/cancel, live order books, positions, open orders, and a UPI payment hub.
 
-- **Real execution only**: no paper trading, fake fills, simulated balances, or demo settlement in production code.
-- **UPI-native funding**: UPI is the preferred user payment rail where supported by the regulated payment/broker stack.
-- **Regulated execution boundary**: the application does not pretend to be an exchange, clearing member, broker, depository, or payment provider. Those capabilities are integrated through explicit adapters.
+Hyperliquid documents these order concepts and TP/SL behavior in its trading documentation. INRLIQUID uses the UX/order-model ideas but does **not** copy Hyperliquid's crypto-perpetual margin, liquidation, funding, or short-selling mechanics into Indian cash equities. citehttps://hyperliquid.gitbook.io/hyperliquid-docs/trading/order-types
+
+## Real execution only
+
+There is no paper trading, fake fill, simulated balance, or demo settlement path. Until a real regulated execution provider is configured, order endpoints fail closed with `503 EXECUTION_UNAVAILABLE`.
+
+## UPI payment hub
+
+The payment layer supports funding, settlement, withdrawal and fee intents through a provider adapter. Provider webhooks must be authenticated, idempotent and reconciled before any cash ledger entry is posted.
 
 ## Repository layout
 
 ```text
-apps/web             Next.js trading UI
-apps/api             Fastify API
-packages/domain      Shared domain types and validation
-packages/adapters    Broker, market-data, UPI and identity interfaces
+apps/web             Next.js trading terminal
+apps/api             Fastify API and order/payment routes
+packages/domain      Shared order, TP/SL, book, position and payment contracts
+packages/adapters    Live provider contracts
 packages/ui          Shared UI primitives
-infra/               Deployment and local infrastructure notes
-docs/                Architecture and compliance decisions
+infra/               PostgreSQL + Redis local infrastructure
+infra/db             Cash, holdings, orders and payment ledger schema
+docs/                Architecture, parity and launch decisions
 .github/workflows/   CI
 ```
 
-## Important
+## Important regulatory boundary
 
-This repository contains **integration-ready application code**, not a claim of regulatory authorization. Live securities trading in India requires the appropriate regulated entities, exchange connectivity, custody/settlement arrangements, KYC/AML controls, and payment rails. Credentials and provider-specific implementations must be supplied only after those relationships are established.
+This repository is software infrastructure, not a claim of authorization to operate a stock exchange, broker, clearing member, depository, payment system, or custodian. The actual production operating model must use the appropriate regulated entities and approved integrations. UPI-only UX does not by itself remove statutory onboarding, AML, securities, custody, or broker obligations.
 
 ## Development
 
@@ -36,8 +43,10 @@ pnpm install
 pnpm dev
 ```
 
-The local application exposes provider interfaces and can be developed against contract tests without fabricating trade execution results.
+For local infrastructure:
 
-## Environment
+```bash
+docker compose -f infra/docker-compose.yml up -d
+```
 
-Copy `.env.example` to `.env.local`. Never commit secrets, signing keys, broker credentials, UPI credentials, or customer data.
+Never commit secrets, provider credentials, signing keys, customer data, or production connection strings.
