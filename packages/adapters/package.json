@@ -2,7 +2,7 @@
   "name": "@inrliquid/adapters",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {"types":"./src/index.ts","default":"./dist/index.js"},
   "scripts": {"typecheck":"tsc -p tsconfig.json --noEmit","build":"tsc -p tsconfig.json","lint":"tsc -p tsconfig.json --noEmit"},
   "dependencies": {"@inrliquid/domain":"workspace:*"},
   "devDependencies":{"@types/node":"^24.3.0","typescript":"^5.9.2"}
