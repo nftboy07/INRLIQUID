@@ -1,0 +1,126 @@
+import { randomUUID } from 'node:crypto';
+import type { Pool } from 'pg';
+import { UpstoxAdapter } from '@inrliquid/adapters';
+import type { BrokerAdapter, CreateOrderRequest, CreateTpSlRequest, OrderReceipt } from '@inrliquid/domain';
+import { decryptSecret } from './token-crypto.js';
+
+function unavailable(message: string): never { throw new Error(message); }
+
+async function brokerForUser(pool: Pool, userId: string): Promise<{ broker: BrokerAdapter; accountId: string; providerAccountId: string }> {
+  const result = await pool.query(`SELECT id,provider,provider_account_id,access_token_encrypted,status FROM broker_accounts WHERE user_id=$1 AND status='ACTIVE' LIMIT 1`, [userId]);
+  const account = result.rows[0];
+  if (!account) unavailable('BROKER_ACCOUNT_NOT_LINKED');
+  if (account.provider !== 'upstox') unavailable('BROKER_PROVIDER_UNSUPPORTED');
+  if (!account.access_token_encrypted) unavailable('BROKER_ACCESS_TOKEN_MISSING');
+  const accessToken = decryptSecret(account.access_token_encrypted);
+  let instrumentMap: Record<string, string> = {};
+  const raw = process.env.UPSTOX_INSTRUMENT_MAP_JSON;
+  if (!raw) unavailable('UPSTOX_INSTRUMENT_MAP_NOT_CONFIGURED');
+  try { instrumentMap = JSON.parse(raw) as Record<string, string>; } catch { unavailable('UPSTOX_INSTRUMENT_MAP_INVALID'); }
+  return { broker: new UpstoxAdapter({ accessToken, orderBaseUrl: process.env.UPSTOX_ORDER_BASE_URL, marketBaseUrl: process.env.UPSTOX_MARKET_BASE_URL, instrumentMap }), accountId: account.id, providerAccountId: account.provider_account_id };
+}
+
+function receiptStatus(status: OrderReceipt['status']): string {
+  return status === 'ACCEPTED' ? 'OPEN' : status === 'REJECTED' ? 'REJECTED' : 'PENDING';
+}
+
+async function recordEvent(pool: Pool, orderId: string, eventType: string, receipt: OrderReceipt, payload: Record<string, unknown> = {}) {
+  await pool.query(`INSERT INTO order_events(id,order_id,event_type,provider_status,payload) VALUES($1,$2,$3,$4,$5)`, [randomUUID(), orderId, eventType, receipt.status, JSON.stringify({ ...payload, providerOrderId: receipt.providerOrderId, acceptedAt: receipt.acceptedAt })]);
+}
+
+function clientOrderId(input: { clientOrderId?: string; idempotencyKey: string }): string {
+  return input.clientOrderId ?? `inrliquid-${input.idempotencyKey}`;
+}
+
+export async function placeUserOrder(pool: Pool, userId: string, input: CreateOrderRequest) {
+  const clientId = clientOrderId(input);
+  const existing = await pool.query(`SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2`, [userId, clientId]);
+  if (existing.rows[0]) return { ...existing.rows[0], idempotent: true };
+  const { broker, accountId } = await brokerForUser(pool, userId);
+  const orderId = randomUUID();
+  await pool.query(`INSERT INTO orders(id,user_id,broker_account_id,client_order_id,provider,exchange,symbol,side,order_type,quantity,limit_price,trigger_price,time_in_force,status,metadata) VALUES($1,$2,$3,$4,'upstox',$5,$6,$7,$8,$9,$10,$11,$12,'PENDING',$13)`, [orderId,userId,accountId,clientId,input.exchange,input.symbol,input.side,input.orderType,input.quantity,input.limitPriceInr ?? null,input.triggerPriceInr ?? null,input.timeInForce,JSON.stringify({ reduceOnly: input.reduceOnly, postOnly: input.postOnly, parentOrderId: input.parentOrderId ?? null, ocoGroupId: input.ocoGroupId ?? null })]);
+  let receipt: OrderReceipt;
+  try {
+    receipt = await broker.placeOrder(input);
+  } catch (error) {
+    await pool.query(`UPDATE orders SET status='UNKNOWN',rejection_reason=$1,updated_at=now() WHERE id=$2`, [String(error), orderId]);
+    await pool.query(`INSERT INTO order_events(id,order_id,event_type,provider_status,payload) VALUES($1,$2,'provider_error','UNKNOWN',$3)`, [randomUUID(), orderId, JSON.stringify({ message: String(error) })]);
+    throw new Error('ORDER_SUBMISSION_AMBIGUOUS');
+  }
+  const status = receiptStatus(receipt.status);
+  await pool.query(`UPDATE orders SET provider_order_id=$1,status=$2,rejection_reason=$3,updated_at=now(),completed_at=CASE WHEN $2='REJECTED' THEN now() ELSE NULL END WHERE id=$4`, [receipt.providerOrderId || null,status,status === 'REJECTED' ? 'PROVIDER_REJECTED' : null,orderId]);
+  await recordEvent(pool, orderId, 'provider_submission', receipt);
+  return { id: orderId, clientOrderId: clientId, providerOrderId: receipt.providerOrderId, status: receipt.status, acceptedAt: receipt.acceptedAt, idempotent: false };
+}
+
+export async function placeUserTpSl(pool: Pool, userId: string, input: CreateTpSlRequest) {
+  const clientId = `tpsl-${input.idempotencyKey}`;
+  const existing = await pool.query(`SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2`, [userId, clientId]);
+  if (existing.rows[0]) return { ...existing.rows[0], idempotent: true };
+  const { broker, accountId } = await brokerForUser(pool, userId);
+  const orderId = randomUUID();
+  const orderType = input.kind === 'TP' ? (input.market ? 'TAKE_MARKET' : 'TAKE_LIMIT') : (input.market ? 'STOP_MARKET' : 'STOP_LIMIT');
+  await pool.query(`INSERT INTO orders(id,user_id,broker_account_id,client_order_id,provider,exchange,symbol,side,order_type,quantity,limit_price,trigger_price,time_in_force,status,metadata) VALUES($1,$2,$3,$4,'upstox',$5,$6,$7,$8,$9,$10,$11,'GTC','PENDING',$12)`, [orderId,userId,accountId,clientId,input.exchange,input.symbol,input.side,orderType,input.quantity,input.limitPriceInr ?? null,input.triggerPriceInr,JSON.stringify({ kind: input.kind, reduceOnly: true, parentOrderId: input.parentOrderId ?? null, ocoGroupId: input.ocoGroupId ?? null })]);
+  let receipt: OrderReceipt;
+  try { receipt = await broker.placeTpSl(input); } catch (error) {
+    await pool.query(`UPDATE orders SET status='UNKNOWN',rejection_reason=$1,updated_at=now() WHERE id=$2`, [String(error), orderId]);
+    await pool.query(`INSERT INTO order_events(id,order_id,event_type,provider_status,payload) VALUES($1,$2,'provider_error','UNKNOWN',$3)`, [randomUUID(), orderId, JSON.stringify({ message: String(error) })]);
+    throw error;
+  }
+  const status = receiptStatus(receipt.status);
+  await pool.query(`UPDATE orders SET provider_order_id=$1,status=$2,rejection_reason=$3,updated_at=now(),completed_at=CASE WHEN $2='REJECTED' THEN now() ELSE NULL END WHERE id=$4`, [receipt.providerOrderId || null,status,status === 'REJECTED' ? 'PROVIDER_REJECTED' : null,orderId]);
+  await recordEvent(pool, orderId, 'provider_submission', receipt, { kind: input.kind });
+  return { id: orderId, clientOrderId: clientId, providerOrderId: receipt.providerOrderId, status: receipt.status, acceptedAt: receipt.acceptedAt, idempotent: false };
+}
+
+export async function modifyUserOrder(pool: Pool, userId: string, localOrderId: string, input: CreateOrderRequest) {
+  const result = await pool.query(`SELECT * FROM orders WHERE id=$1 AND user_id=$2 FOR UPDATE`, [localOrderId, userId]);
+  const order = result.rows[0];
+  if (!order) throw new Error('ORDER_NOT_FOUND');
+  if (!order.provider_order_id) throw new Error('ORDER_PROVIDER_ID_MISSING');
+  const { broker } = await brokerForUser(pool, userId);
+  const receipt = await broker.modifyOrder(order.provider_order_id, input);
+  await pool.query(`UPDATE orders SET quantity=$1,limit_price=$2,trigger_price=$3,status=$4,updated_at=now(),version=version+1 WHERE id=$5`, [input.quantity,input.limitPriceInr ?? null,input.triggerPriceInr ?? null,receiptStatus(receipt.status),localOrderId]);
+  await recordEvent(pool, localOrderId, 'provider_modify', receipt);
+  return { id: localOrderId, providerOrderId: order.provider_order_id, ...receipt };
+}
+
+export async function cancelUserOrder(pool: Pool, userId: string, localOrderId: string) {
+  const result = await pool.query(`SELECT * FROM orders WHERE id=$1 AND user_id=$2`, [localOrderId, userId]);
+  const order = result.rows[0];
+  if (!order) throw new Error('ORDER_NOT_FOUND');
+  if (!order.provider_order_id) throw new Error('ORDER_PROVIDER_ID_MISSING');
+  const { broker } = await brokerForUser(pool, userId);
+  await broker.cancelOrder(order.provider_order_id);
+  await pool.query(`UPDATE orders SET status='CANCELED',updated_at=now(),completed_at=now(),version=version+1 WHERE id=$1 AND status IN ('PENDING','OPEN','PARTIALLY_FILLED')`, [localOrderId]);
+  await pool.query(`INSERT INTO order_events(id,order_id,event_type,provider_status,payload) VALUES($1,$2,'provider_cancel','CANCELED',$3)`, [randomUUID(), localOrderId, JSON.stringify({ providerOrderId: order.provider_order_id })]);
+}
+
+function mapProviderStatus(value: unknown): string {
+  const s = String(value ?? '').toLowerCase().replace(/_/g, ' ');
+  if (s.includes('complete') || s === 'filled') return 'FILLED';
+  if (s.includes('partial')) return 'PARTIALLY_FILLED';
+  if (s.includes('cancel')) return 'CANCELED';
+  if (s.includes('reject')) return 'REJECTED';
+  if (s.includes('expire')) return 'EXPIRED';
+  if (s.includes('open') || s.includes('trigger') || s.includes('received') || s.includes('pending')) return 'OPEN';
+  return 'UNKNOWN';
+}
+
+export async function applyUpstoxOrderWebhook(pool: Pool, payload: Record<string, unknown>) {
+  if (payload.update_type !== 'order') return { ignored: true };
+  const providerOrderId = String(payload.order_id ?? '');
+  const providerAccountId = String(payload.user_id ?? payload.userId ?? payload.placed_by ?? '');
+  if (!providerOrderId || !providerAccountId) return { ignored: true };
+  const orderResult = await pool.query(`SELECT o.* FROM orders o JOIN broker_accounts b ON b.id=o.broker_account_id WHERE o.provider='upstox' AND o.provider_order_id=$1 AND b.provider_account_id=$2 LIMIT 1`, [providerOrderId, providerAccountId]);
+  const order = orderResult.rows[0];
+  if (!order) return { ignored: true, reason: 'ORDER_NOT_FOUND' };
+  const eventId = `upstox:${providerOrderId}:${String(payload.status ?? '')}:${String(payload.order_timestamp ?? '')}:${String(payload.filled_quantity ?? '')}`;
+  const inserted = await pool.query(`INSERT INTO order_events(id,order_id,provider_event_id,event_type,provider_status,filled_quantity,average_fill_price,payload) VALUES($1,$2,$3,'webhook',$4,$5,$6,$7) ON CONFLICT(provider_event_id) DO NOTHING`, [randomUUID(),order.id,eventId,String(payload.status ?? ''),Number(payload.filled_quantity ?? 0),Number(payload.average_price ?? 0) || null,JSON.stringify(payload)]);
+  if (!inserted.rowCount) return { duplicate: true };
+  const status = mapProviderStatus(payload.status);
+  const filled = Number(payload.filled_quantity ?? 0);
+  const avg = Number(payload.average_price ?? 0) || null;
+  await pool.query(`UPDATE orders SET status=$1,filled_quantity=$2,average_fill_price=COALESCE($3,average_fill_price),last_provider_event_at=now(),updated_at=now(),completed_at=CASE WHEN $1 IN ('FILLED','CANCELED','REJECTED','EXPIRED') THEN now() ELSE completed_at END,version=version+1 WHERE id=$4`, [status,filled,avg,order.id]);
+  return { applied: true, orderId: order.id, status };
+}
