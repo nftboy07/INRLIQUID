@@ -1,0 +1,9 @@
+{
+  "name": "@inrliquid/adapters",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {"typecheck":"tsc -p tsconfig.json --noEmit","build":"tsc -p tsconfig.json","lint":"tsc -p tsconfig.json --noEmit"},
+  "dependencies": {"@inrliquid/domain":"workspace:*"},
+  "devDependencies":{"typescript":"^5.9.2"}
+}
