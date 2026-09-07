@@ -1,25 +1,13 @@
-CREATE TABLE IF NOT EXISTS payment_intents (
-  id UUID PRIMARY KEY,
-  user_id UUID NOT NULL,
-  wallet_id UUID NOT NULL REFERENCES wallet_accounts(id),
-  provider TEXT NOT NULL CHECK (provider IN ('razorpay','razorpayx','stripe','crypto')),
-  payment_method TEXT NOT NULL CHECK (payment_method IN ('UPI','CARD','CRYPTO')),
-  provider_payment_id TEXT,
-  asset TEXT,
-  network TEXT,
-  amount_paise BIGINT,
-  amount_minor BIGINT,
-  settlement_amount_minor BIGINT,
-  settlement_currency CHAR(3),
-  status TEXT NOT NULL CHECK (status IN ('CREATED','PENDING','PROCESSING','SUCCEEDED','COMPLETED','FAILED','CANCELED','EXPIRED','REQUIRES_ACTION')),
-  idempotency_key TEXT NOT NULL UNIQUE,
-  client_secret TEXT,
-  deposit_address TEXT,
-  payment_url TEXT,
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  completed_at TIMESTAMPTZ
-);
+ALTER TABLE payment_intents ADD COLUMN IF NOT EXISTS asset TEXT;
+ALTER TABLE payment_intents ADD COLUMN IF NOT EXISTS network TEXT;
+ALTER TABLE payment_intents ADD COLUMN IF NOT EXISTS client_secret TEXT;
+ALTER TABLE payment_intents ADD COLUMN IF NOT EXISTS deposit_address TEXT;
+ALTER TABLE payment_intents ADD COLUMN IF NOT EXISTS payment_url TEXT;
+ALTER TABLE payment_intents ADD COLUMN IF NOT EXISTS amount_minor BIGINT;
+ALTER TABLE payment_intents DROP CONSTRAINT IF EXISTS payment_intents_status_check;
+ALTER TABLE payment_intents ADD CONSTRAINT payment_intents_status_check CHECK (status IN ('CREATED','PENDING','PROCESSING','SUCCEEDED','COMPLETED','FAILED','CANCELED','EXPIRED','REQUIRES_ACTION'));
+ALTER TABLE payment_intents DROP CONSTRAINT IF EXISTS payment_intents_provider_check;
+ALTER TABLE payment_intents ADD CONSTRAINT payment_intents_provider_check CHECK (provider IN ('razorpay','razorpayx','stripe','crypto'));
 
 CREATE UNIQUE INDEX IF NOT EXISTS payment_intents_provider_payment_unique
   ON payment_intents(provider, provider_payment_id)
@@ -40,10 +28,5 @@ CREATE TABLE IF NOT EXISTS crypto_deposits (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   confirmed_at TIMESTAMPTZ
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS crypto_deposits_tx_unique
-  ON crypto_deposits(network, tx_hash)
-  WHERE tx_hash IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS crypto_deposits_address_idx
-  ON crypto_deposits(deposit_address, network, status);
+CREATE UNIQUE INDEX IF NOT EXISTS crypto_deposits_tx_unique ON crypto_deposits(network, tx_hash) WHERE tx_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS crypto_deposits_address_idx ON crypto_deposits(deposit_address, network, status);
