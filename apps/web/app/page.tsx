@@ -1,43 +1,74 @@
+'use client';
+
+import { useState } from 'react';
+
 const watchlist = [
-  ['RELIANCE', 'NSE', '—', '—'],
-  ['TCS', 'NSE', '—', '—'],
-  ['HDFCBANK', 'NSE', '—', '—'],
-  ['INFY', 'NSE', '—', '—']
+  ['RELIANCE', 'NSE'], ['TCS', 'NSE'], ['HDFCBANK', 'NSE'], ['INFY', 'NSE'], ['ICICIBANK', 'NSE']
 ];
+const orderTypes = ['MARKET', 'LIMIT', 'STOP_MARKET', 'STOP_LIMIT', 'TAKE_MARKET', 'TAKE_LIMIT', 'SCALE', 'TWAP'];
 
 export default function Home() {
+  const [symbol, setSymbol] = useState('RELIANCE');
+  const [side, setSide] = useState<'BUY' | 'SELL'>('BUY');
+  const [orderType, setOrderType] = useState('MARKET');
+  const [quantity, setQuantity] = useState('1');
+  const [price, setPrice] = useState('');
+  const [trigger, setTrigger] = useState('');
+
+  const conditional = orderType.includes('STOP') || orderType.includes('TAKE');
+  const needsLimit = orderType === 'LIMIT' || orderType.endsWith('LIMIT');
+
   return (
-    <main className="shell">
+    <main className="terminal">
       <header className="topbar">
         <div className="brand">INR<span>LIQUID</span></div>
+        <nav><span>Trade</span><span>Portfolio</span><span>Orders</span><span>Payments</span></nav>
         <div className="status">REAL EXECUTION ONLY</div>
       </header>
 
-      <section className="hero">
-        <div>
-          <p className="eyebrow">INDIAN MARKETS / INR</p>
-          <h1>Trade Indian equities with a market-first interface.</h1>
-          <p className="sub">UPI-native funding, live market data and real broker execution — with no paper trading layer.</p>
-        </div>
-        <div className="cta-card">
-          <p>Execution</p>
-          <strong>Provider required</strong>
-          <span>Live order routing is intentionally disabled until a regulated execution provider is configured.</span>
-        </div>
+      <section className="marketbar">
+        <div><small>MARKET</small><strong>{symbol} / INR</strong><span>NSE · LIVE PROVIDER</span></div>
+        <div><small>LAST</small><strong>₹ —</strong></div>
+        <div><small>24H</small><strong>—</strong></div>
+        <div><small>BEST BID / ASK</small><strong>— / —</strong></div>
+        <div className="provider"><small>EXECUTION</small><strong>PROVIDER REQUIRED</strong></div>
       </section>
 
-      <section className="panel">
-        <div className="panel-head"><h2>Watchlist</h2><span>Live provider data</span></div>
-        {watchlist.map(([symbol, exchange, price, move]) => (
-          <div className="row" key={symbol}>
-            <div><strong>{symbol}</strong><span>{exchange}</span></div>
-            <strong>{price === '—' ? 'Awaiting feed' : `₹${price}`}</strong>
-            <span>{move}</span>
-          </div>
-        ))}
+      <section className="grid">
+        <aside className="panel watchlist">
+          <div className="panel-title"><strong>Markets</strong><span>Search</span></div>
+          <input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} placeholder="Search symbol" />
+          {watchlist.map(([s, ex]) => <button className={s === symbol ? 'market active' : 'market'} key={s} onClick={() => setSymbol(s)}><b>{s}</b><span>{ex}</span><em>—</em></button>)}
+        </aside>
+
+        <section className="panel book">
+          <div className="panel-title"><strong>Order Book</strong><span>NSE</span></div>
+          <div className="book-head"><span>PRICE</span><span>SIZE</span></div>
+          {[1,2,3,4,5].map(i => <div className="book-row ask" key={`a${i}`}><span>—</span><span>—</span></div>)}
+          <div className="mid">₹ — <span>mid</span></div>
+          {[1,2,3,4,5].map(i => <div className="book-row bid" key={`b${i}`}><span>—</span><span>—</span></div>)}
+        </section>
+
+        <section className="panel order">
+          <div className="side-tabs"><button className={side === 'BUY' ? 'selected buy' : ''} onClick={() => setSide('BUY')}>BUY</button><button className={side === 'SELL' ? 'selected sell' : ''} onClick={() => setSide('SELL')}>SELL</button></div>
+          <label>Order type<select value={orderType} onChange={e => setOrderType(e.target.value)}>{orderTypes.map(t => <option key={t}>{t}</option>)}</select></label>
+          <label>Quantity<input type="number" min="1" value={quantity} onChange={e => setQuantity(e.target.value)} /></label>
+          {needsLimit && <label>Limit price (₹)<input inputMode="decimal" value={price} onChange={e => setPrice(e.target.value)} placeholder="0.00" /></label>}
+          {conditional && <label>Trigger price (₹)<input inputMode="decimal" value={trigger} onChange={e => setTrigger(e.target.value)} placeholder="0.00" /></label>}
+          <label className="check"><input type="checkbox" /> Reduce only</label>
+          <label className="check"><input type="checkbox" /> Post only / ALO</label>
+          <button className={side === 'BUY' ? 'submit buy-bg' : 'submit sell-bg'} disabled>{side} {symbol}</button>
+          <p className="disabled-note">Live execution is unavailable until a regulated broker provider is configured. No order is simulated.</p>
+        </section>
       </section>
 
-      <footer>INRLIQUID · integration-ready infrastructure · no simulated execution</footer>
+      <section className="bottom-grid">
+        <div className="panel"><div className="panel-title"><strong>Positions</strong><span>All markets</span></div><div className="empty">No live position data</div></div>
+        <div className="panel"><div className="panel-title"><strong>Open Orders</strong><span>Cancel all</span></div><div className="empty">No live order data</div></div>
+        <div className="panel"><div className="panel-title"><strong>Payment Hub</strong><span>UPI</span></div><div className="payment"><strong>₹ —</strong><span>Available balance</span><button disabled>ADD INR VIA UPI</button><button disabled>WITHDRAW TO UPI</button></div></div>
+      </section>
+
+      <footer>INRLIQUID · Hyperliquid-style trading controls adapted to Indian cash-equity execution · no simulated execution</footer>
     </main>
   );
 }
