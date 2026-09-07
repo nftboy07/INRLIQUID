@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: inrliquid
+      POSTGRES_USER: inrliquid
+      POSTGRES_PASSWORD: inrliquid_dev_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - inrliquid-postgres:/var/lib/postgresql/data
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - inrliquid-redis:/data
+volumes:
+  inrliquid-postgres:
+  inrliquid-redis:
