@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,8 +14,10 @@ const pool = new Pool({
 async function migrate() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL_REQUIRED_FOR_MIGRATIONS');
   const client = await pool.connect();
+  let locked = false;
   try {
     await client.query('SELECT pg_advisory_lock(hashtext($1))', ['inrliquid:migrations']);
+    locked = true;
     await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
       version TEXT PRIMARY KEY,
       checksum TEXT NOT NULL,
@@ -28,18 +31,17 @@ async function migrate() {
     for (const file of files) {
       const sql = await readFile(join(migrationsDir, file), 'utf8');
       const version = file.replace(/\.sql$/, '');
+      const digest = checksum(sql);
       const existing = await client.query('SELECT checksum FROM schema_migrations WHERE version=$1', [version]);
       if (existing.rowCount) {
-        if (existing.rows[0].checksum !== checksum(sql)) {
-          throw new Error(`MIGRATION_CHECKSUM_MISMATCH:${version}`);
-        }
+        if (existing.rows[0].checksum !== digest) throw new Error(`MIGRATION_CHECKSUM_MISMATCH:${version}`);
         continue;
       }
 
       await client.query('BEGIN');
       try {
         await client.query(sql);
-        await client.query('INSERT INTO schema_migrations(version,checksum) VALUES($1,$2)', [version, checksum(sql)]);
+        await client.query('INSERT INTO schema_migrations(version,checksum) VALUES($1,$2)', [version, digest]);
         await client.query('COMMIT');
         console.log(`Applied migration ${version}`);
       } catch (error) {
@@ -48,19 +50,14 @@ async function migrate() {
       }
     }
   } finally {
-    await client.query('SELECT pg_advisory_unlock(hashtext($1))', ['inrliquid:migrations']).catch(() => undefined);
+    if (locked) await client.query('SELECT pg_advisory_unlock(hashtext($1))', ['inrliquid:migrations']).catch(() => undefined);
     client.release();
     await pool.end();
   }
 }
 
 function checksum(value: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < value.length; i += 1) {
-    hash ^= value.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
 migrate().catch((error) => {
