@@ -8,7 +8,7 @@
 - If multiple customers trade through the product, implement a customer-specific broker-account authorization model; do not use one operator access token for all customers.
 - Complete provider sandbox/certification testing and obtain production API approval.
 
-Upstox provides order-update WebSocket/postback mechanisms for order updates; these should be used for reconciliation rather than assuming a successful order submission means the order filled. citeturn0search7turn0search14
+Upstox provides order-update WebSocket/postback mechanisms for order updates; these should be used for reconciliation rather than assuming a successful order submission means the order filled. Upstox also uses OAuth 2.0 for customer authorization, so production customer accounts should be linked through the customer's authorization flow rather than collecting broker credentials.
 
 ## Payments / banking
 
@@ -18,7 +18,7 @@ Upstox provides order-update WebSocket/postback mechanisms for order updates; th
 - Configure webhook secrets and test duplicate/out-of-order events.
 - Confirm production limits, settlement timing, refunds and dispute handling.
 
-Razorpay recommends webhook-driven payout reconciliation, deduplication, and use of idempotency keys for payouts. citeturn0search3turn0search5
+Razorpay recommends webhook-driven payout reconciliation, deduplication, and idempotency controls. Payout lifecycle events can arrive out of order, so terminal-state handling must be idempotent.
 
 ## VDA / crypto
 
@@ -27,7 +27,7 @@ Razorpay recommends webhook-driven payout reconciliation, deduplication, and use
 - Contract a provider that can document the intended INR settlement flow, customer screening, transaction monitoring, confirmations, refunds and reconciliation.
 - Never enable generic crypto funding merely by setting an API URL; production crypto requires an approved provider contract and operational controls.
 
-FIU-IND guidance identifies exchange between VDA and fiat, VDA-to-VDA exchange, transfers, and custody/administration as covered activities when performed for others in business. citeturn0search48
+FIU-IND guidance identifies exchange between VDA and fiat, VDA-to-VDA exchange, transfers, and custody/administration as covered activities when performed for others in business.
 
 ## Identity / KYC
 
