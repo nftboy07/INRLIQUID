@@ -1,25 +1,8 @@
 {
-  "name": "@inrliquid/api",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test",
-    "lint": "tsc -p tsconfig.json --noEmit"
-  },
-  "dependencies": {
-    "@inrliquid/adapters": "workspace:*",
-    "@inrliquid/domain": "workspace:*",
-    "fastify": "^5.5.0",
-    "fastify-raw-body": "^5.0.0",
-    "pg": "^8.16.3"
-  },
-  "devDependencies": {
-    "@types/node": "^24.3.0",
-    "@types/pg": "^8.15.5",
-    "tsx": "^4.20.5",
-    "typescript": "^5.9.2"
-  }
+  "name":"@inrliquid/api",
+  "private":true,
+  "type":"module",
+  "scripts":{"dev":"tsx watch src/server.ts","build":"tsc -p tsconfig.json","typecheck":"tsc -p tsconfig.json --noEmit","test":"node --experimental-strip-types --test","lint":"tsc -p tsconfig.json --noEmit"},
+  "dependencies":{"@inrliquid/adapters":"workspace:*","@inrliquid/domain":"workspace:*","fastify":"^5.5.0","fastify-raw-body":"^5.0.0","pg":"^8.16.3"},
+  "devDependencies":{"@types/node":"^24.3.0","@types/pg":"^8.15.5","tsx":"^4.20.5","typescript":"^5.9.2"}
 }
