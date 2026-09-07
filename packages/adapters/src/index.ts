@@ -3,6 +3,7 @@ import type { BrokerAdapter, MarketDataAdapter, UpiAdapter } from '@inrliquid/do
 export type { BrokerAdapter, MarketDataAdapter, UpiAdapter } from '@inrliquid/domain';
 export {
   RazorpayUpiAdapter,
+  RazorpayRequestError,
   createRazorpayPayout,
   createRazorpayContact,
   createRazorpayBankFundAccount,
