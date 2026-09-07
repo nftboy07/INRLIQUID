@@ -3,85 +3,52 @@ import rawBody from 'fastify-raw-body';
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
 import { z } from 'zod';
-import { createOrderRequestSchema, createPaymentIntentSchema, createTpSlRequestSchema, type BrokerAdapter, type MarketDataAdapter, type UpiAdapter } from '@inrliquid/domain';
-import { RazorpayUpiAdapter } from '@inrliquid/adapters';
+import { createCardOrUpiPaymentSchema, createCryptoPaymentSchema, createOrderRequestSchema, createPaymentIntentSchema, createTpSlRequestSchema, type BrokerAdapter, type MarketDataAdapter, type UpiAdapter } from '@inrliquid/domain';
+import { RazorpayUpiAdapter, createStripePaymentIntent, verifyStripeWebhook, type StripeConfig } from '@inrliquid/adapters';
 import { createBeneficiaryBank, createBeneficiaryContact, createBeneficiaryVpa, createDeposit, createWithdrawal, getWallet, listBeneficiaries, listWalletTransactions, saveBeneficiary } from './wallet.js';
+import { createStripeCryptoPaymentIntent, cancelStripePaymentIntent } from '@inrliquid/adapters';
+import { createStripeCryptoPaymentIntent as createCryptoIntent } from '@inrliquid/adapters';
+import { createStripeWalletPayment, createStripeCryptoWalletPayment, settleStripeWebhook } from './payments.js';
 
-const app = Fastify({ logger: true });
-await app.register(rawBody, { field: 'rawBody', global: false, encoding: 'utf8', runFirst: true });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const unavailable = (name: string) => new Error(`${name} provider is not configured for live operation`);
-const razorpayConfigured = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
-const razorpayConfig = razorpayConfigured ? { keyId: process.env.RAZORPAY_KEY_ID!, keySecret: process.env.RAZORPAY_KEY_SECRET!, apiBaseUrl: process.env.RAZORPAY_API_BASE_URL, payoutAccountNumber: process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER } : null;
-const razorpay = razorpayConfig ? new RazorpayUpiAdapter(razorpayConfig) : null;
-const broker: BrokerAdapter = { async placeOrder(){throw unavailable('Broker')}, async placeTpSl(){throw unavailable('Broker')}, async cancelOrder(){throw unavailable('Broker')}, async modifyOrder(){throw unavailable('Broker')} };
-const marketData: MarketDataAdapter = { async quote(){throw unavailable('Market-data')}, async orderBook(){throw unavailable('Market-data')} };
-const upi: UpiAdapter = razorpay ?? { async createPaymentIntent(){throw unavailable('UPI')}, async cancelPaymentIntent(){throw unavailable('UPI')} };
+const app=Fastify({logger:true});
+await app.register(rawBody,{field:'rawBody',global:false,encoding:'utf8',runFirst:true});
+const pool=new Pool({connectionString:process.env.DATABASE_URL});
+const unavailable=(name:string)=>new Error(`${name} provider is not configured for live operation`);
+const razorpayConfigured=Boolean(process.env.RAZORPAY_KEY_ID&&process.env.RAZORPAY_KEY_SECRET);
+const razorpayConfig=razorpayConfigured?{keyId:process.env.RAZORPAY_KEY_ID!,keySecret:process.env.RAZORPAY_KEY_SECRET!,apiBaseUrl:process.env.RAZORPAY_API_BASE_URL,payoutAccountNumber:process.env.RAZORPAYX_PAYOUT_ACCOUNT_NUMBER}:null;
+const razorpay=razorpayConfig?new RazorpayUpiAdapter(razorpayConfig):null;
+const stripeConfigured=Boolean(process.env.STRIPE_SECRET_KEY);
+const stripeConfig:StripeConfig|null=stripeConfigured?{secretKey:process.env.STRIPE_SECRET_KEY!,apiBaseUrl:process.env.STRIPE_API_BASE_URL}:null;
+const stripeCardEnabled=stripeConfigured&&process.env.STRIPE_CARD_ENABLED!=='false';
+const stripeUpiEnabled=stripeConfigured&&process.env.STRIPE_UPI_ENABLED==='true';
+const stripeCryptoEnabled=stripeConfigured&&process.env.STRIPE_CRYPTO_ENABLED==='true';
+const cryptoUsdInrRate=Number(process.env.CRYPTO_USD_INR_RATE??0);
+const broker:BrokerAdapter={async placeOrder(){throw unavailable('Broker')},async placeTpSl(){throw unavailable('Broker')},async cancelOrder(){throw unavailable('Broker')},async modifyOrder(){throw unavailable('Broker')}};
+const marketData:MarketDataAdapter={async quote(){throw unavailable('Market-data')},async orderBook(){throw unavailable('Market-data')}};
+const upi:UpiAdapter=razorpay??{async createPaymentIntent(){throw unavailable('UPI')},async cancelPaymentIntent(){throw unavailable('UPI')}};
+function userId(request:{headers:Record<string,string|string[]|undefined>}){if(process.env.ALLOW_DEV_USER_HEADER!=='true')throw new Error('AUTH_PROVIDER_REQUIRED');const id=request.headers['x-user-id'];if(typeof id!=='string'||!z.string().uuid().safeParse(id).success)throw new Error('AUTH_REQUIRED');return id;}
+function razorpaySignature(raw:string,signature:string|undefined){const secret=process.env.RAZORPAY_WEBHOOK_SECRET;if(!secret||!signature)return false;const expected=Buffer.from(createHmac('sha256',secret).update(raw,'utf8').digest('hex'),'utf8');const received=Buffer.from(signature,'utf8');return expected.length===received.length&&timingSafeEqual(expected,received);}
+function stripeSignature(raw:string,signature:string|undefined){return verifyStripeWebhook(raw,signature,process.env.STRIPE_WEBHOOK_SECRET);}
 
-function userId(request: {headers: Record<string,string|string[]|undefined>}) {
-  if (process.env.ALLOW_DEV_USER_HEADER !== 'true') throw new Error('AUTH_PROVIDER_REQUIRED');
-  const id = request.headers['x-user-id'];
-  if (typeof id !== 'string' || !z.string().uuid().safeParse(id).success) throw new Error('AUTH_REQUIRED');
-  return id;
-}
-function verifyWebhook(raw: string, signature: string|undefined) {
-  const secret=process.env.RAZORPAY_WEBHOOK_SECRET; if(!secret||!signature)return false;
-  const expected=Buffer.from(createHmac('sha256',secret).update(raw,'utf8').digest('hex'),'utf8'); const received=Buffer.from(signature,'utf8');
-  return expected.length===received.length&&timingSafeEqual(expected,received);
-}
-function configOr503(reply: any) { if(!razorpayConfig){reply.code(503).send({error:'PAYMENT_PROVIDER_NOT_CONFIGURED'});return false;} return true; }
+app.get('/health',async()=>({status:'ok',service:'inrliquid-api',providers:{razorpay:razorpayConfigured,stripe:stripeConfigured,stripeCard:stripeCardEnabled,stripeUpi:stripeUpiEnabled,stripeCrypto:stripeCryptoEnabled,broker:false,marketData:false},auth:{devHeader:process.env.ALLOW_DEV_USER_HEADER==='true'}}));
+app.get('/v1/payments/providers',async()=>({razorpayUpi:razorpayConfigured,stripeCard:stripeCardEnabled,stripeUpi:stripeUpiEnabled,stripeCrypto:stripeCryptoEnabled,cryptoRateConfigured:cryptoUsdInrRate>0}));
 
-app.get('/health', async()=>({status:'ok',service:'inrliquid-api',providers:{razorpay:razorpayConfigured, broker:false, marketData:false},auth:{devHeader:process.env.ALLOW_DEV_USER_HEADER==='true'}}));
+app.post('/v1/webhooks/razorpay',{config:{rawBody:true}},async(request,reply)=>{const raw=String((request as typeof request&{rawBody?:string}).rawBody??'');if(!razorpaySignature(raw,request.headers['x-razorpay-signature'] as string|undefined))return reply.code(401).send({error:'INVALID_WEBHOOK_SIGNATURE'});const payload=JSON.parse(raw) as Record<string,any>;const eventId=String(payload.id??randomUUID()),eventType=String(payload.event??'unknown');const inserted=await pool.query(`INSERT INTO payment_webhook_events(event_id,provider,event_type,payload) VALUES($1,'razorpay',$2,$3) ON CONFLICT(event_id) DO NOTHING`,[eventId,eventType,payload]);if(!inserted.rowCount)return reply.send({ok:true,duplicate:true});const client=await pool.connect();try{await client.query('BEGIN');if(eventType==='payment_link.paid'){const paymentId=String(payload.payload?.payment_link?.entity?.id??''),paymentAmount=Number(payload.payload?.payment_link?.entity?.amount??0);if(paymentId&&Number.isInteger(paymentAmount)&&paymentAmount>0){const tx=await client.query(`SELECT * FROM wallet_transactions WHERE provider='razorpay' AND provider_transaction_id=$1 FOR UPDATE`,[paymentId]);if(tx.rows[0]?.status==='PENDING'&&Number(tx.rows[0].amount_paise)===paymentAmount){await client.query(`UPDATE wallet_transactions SET status='COMPLETED',completed_at=now() WHERE id=$1`,[tx.rows[0].id]);await client.query(`UPDATE wallet_accounts SET available_paise=available_paise+$1,updated_at=now() WHERE id=$2`,[paymentAmount,tx.rows[0].wallet_id]);}}}if(['payout.processed','payout.failed','payout.reversed'].includes(eventType)){const payout=payload.payload?.payout?.entity,payoutId=String(payout?.id??''),reference=String(payout?.reference_id??'');const tx=await client.query(`SELECT * FROM wallet_transactions WHERE provider='razorpayx' AND (provider_transaction_id=$1 OR metadata->>'idempotencyKey'=$2) FOR UPDATE`,[payoutId,reference]);if(tx.rows[0]){if(eventType==='payout.processed'&&tx.rows[0].status==='PENDING'){await client.query(`UPDATE wallet_transactions SET status='COMPLETED',provider_transaction_id=COALESCE(NULLIF($1,''),provider_transaction_id),completed_at=now() WHERE id=$2`,[payoutId,tx.rows[0].id]);await client.query(`UPDATE wallet_accounts SET locked_paise=locked_paise-$1,updated_at=now() WHERE id=$2`,[tx.rows[0].amount_paise,tx.rows[0].wallet_id]);}else if(eventType==='payout.failed'&&tx.rows[0].status==='PENDING'){await client.query(`UPDATE wallet_transactions SET status='FAILED',provider_transaction_id=COALESCE(NULLIF($1,''),provider_transaction_id),completed_at=now() WHERE id=$2`,[payoutId,tx.rows[0].id]);await client.query(`UPDATE wallet_accounts SET locked_paise=locked_paise-$1,available_paise=available_paise+$1,updated_at=now() WHERE id=$2`,[tx.rows[0].amount_paise,tx.rows[0].wallet_id]);}else if(eventType==='payout.reversed'&&tx.rows[0].status==='COMPLETED'){await client.query(`UPDATE wallet_transactions SET status='REVERSED',completed_at=now() WHERE id=$1`,[tx.rows[0].id]);await client.query(`UPDATE wallet_accounts SET available_paise=available_paise+$1,updated_at=now() WHERE id=$2`,[tx.rows[0].amount_paise,tx.rows[0].wallet_id]);}}}await client.query(`UPDATE payment_webhook_events SET processed_at=now() WHERE event_id=$1`,[eventId]);await client.query('COMMIT');return reply.send({ok:true});}catch(error){await client.query('ROLLBACK');throw error}finally{client.release()}});
 
-app.post('/v1/webhooks/razorpay',{config:{rawBody:true}},async(request,reply)=>{
-  const raw=String((request as typeof request & {rawBody?:string}).rawBody??'');
-  if(!verifyWebhook(raw,request.headers['x-razorpay-signature'] as string|undefined))return reply.code(401).send({error:'INVALID_WEBHOOK_SIGNATURE'});
-  const payload=JSON.parse(raw) as Record<string,any>; const eventId=String(payload.id??randomUUID()); const eventType=String(payload.event??'unknown');
-  const inserted=await pool.query(`INSERT INTO payment_webhook_events(event_id,provider,event_type,payload) VALUES($1,'razorpay',$2,$3) ON CONFLICT(event_id) DO NOTHING`,[eventId,eventType,payload]);
-  if(!inserted.rowCount)return reply.send({ok:true,duplicate:true});
-  const client=await pool.connect();
-  try {
-    await client.query('BEGIN');
-    if(eventType==='payment_link.paid') {
-      const paymentId=String(payload.payload?.payment_link?.entity?.id??''); const paymentAmount=Number(payload.payload?.payment_link?.entity?.amount??0);
-      if(paymentId && Number.isInteger(paymentAmount) && paymentAmount>0) {
-        const tx=await client.query(`SELECT * FROM wallet_transactions WHERE provider='razorpay' AND provider_transaction_id=$1 FOR UPDATE`,[paymentId]);
-        if(tx.rows[0]?.status==='PENDING' && Number(tx.rows[0].amount_paise)===paymentAmount) {
-          await client.query(`UPDATE wallet_transactions SET status='COMPLETED',completed_at=now() WHERE id=$1`,[tx.rows[0].id]);
-          await client.query(`UPDATE wallet_accounts SET available_paise=available_paise+$1,updated_at=now() WHERE id=$2`,[paymentAmount,tx.rows[0].wallet_id]);
-        }
-      }
-    }
-    if(['payout.processed','payout.failed','payout.reversed'].includes(eventType)) {
-      const payout=payload.payload?.payout?.entity; const payoutId=String(payout?.id??''); const reference=String(payout?.reference_id??'');
-      const tx=await client.query(`SELECT * FROM wallet_transactions WHERE provider='razorpayx' AND (provider_transaction_id=$1 OR metadata->>'idempotencyKey'=$2) FOR UPDATE`,[payoutId,reference]);
-      if(tx.rows[0]) {
-        if(eventType==='payout.processed' && tx.rows[0].status==='PENDING') {
-          await client.query(`UPDATE wallet_transactions SET status='COMPLETED',provider_transaction_id=COALESCE(NULLIF($1,''),provider_transaction_id),completed_at=now() WHERE id=$2`,[payoutId,tx.rows[0].id]);
-          await client.query(`UPDATE wallet_accounts SET locked_paise=locked_paise-$1,updated_at=now() WHERE id=$2`,[tx.rows[0].amount_paise,tx.rows[0].wallet_id]);
-        } else if(eventType==='payout.failed' && tx.rows[0].status==='PENDING') {
-          await client.query(`UPDATE wallet_transactions SET status='FAILED',provider_transaction_id=COALESCE(NULLIF($1,''),provider_transaction_id),completed_at=now() WHERE id=$2`,[payoutId,tx.rows[0].id]);
-          await client.query(`UPDATE wallet_accounts SET locked_paise=locked_paise-$1,available_paise=available_paise+$1,updated_at=now() WHERE id=$2`,[tx.rows[0].amount_paise,tx.rows[0].wallet_id]);
-        } else if(eventType==='payout.reversed' && tx.rows[0].status==='COMPLETED') {
-          await client.query(`UPDATE wallet_transactions SET status='REVERSED',completed_at=now() WHERE id=$1`,[tx.rows[0].id]);
-          await client.query(`UPDATE wallet_accounts SET available_paise=available_paise+$1,updated_at=now() WHERE id=$2`,[tx.rows[0].amount_paise,tx.rows[0].wallet_id]);
-        }
-      }
-    }
-    await client.query(`UPDATE payment_webhook_events SET processed_at=now() WHERE event_id=$1`,[eventId]);
-    await client.query('COMMIT'); return reply.send({ok:true});
-  } catch(error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
-});
+app.post('/v1/webhooks/stripe',{config:{rawBody:true}},async(request,reply)=>{const raw=String((request as typeof request&{rawBody?:string}).rawBody??'');if(!stripeSignature(raw,request.headers['stripe-signature'] as string|undefined))return reply.code(401).send({error:'INVALID_WEBHOOK_SIGNATURE'});const payload=JSON.parse(raw) as Record<string,any>,eventId=String(payload.id??randomUUID()),eventType=String(payload.type??'unknown');const inserted=await pool.query(`INSERT INTO payment_webhook_events(event_id,provider,event_type,payload) VALUES($1,'stripe',$2,$3) ON CONFLICT(event_id) DO NOTHING`,[eventId,eventType,payload]);if(!inserted.rowCount)return reply.send({ok:true,duplicate:true});try{await settleStripeWebhook(pool,payload);await pool.query(`UPDATE payment_webhook_events SET processed_at=now() WHERE event_id=$1`,[eventId]);return reply.send({ok:true})}catch(error){throw error}});
 
 app.get('/v1/wallet',async(request,reply)=>{try{return await getWallet(pool,userId(request))}catch(e){return reply.code(401).send({error:String(e)})}});
-app.get('/v1/wallet/transactions',async(request,reply)=>{try{const uid=userId(request);const q=z.object({limit:z.coerce.number().int().min(1).max(200).default(100)}).parse(request.query);return await listWalletTransactions(pool,uid,q.limit)}catch(e){return reply.code(401).send({error:String(e)})}});
+app.get('/v1/wallet/transactions',async(request,reply)=>{try{const uid=userId(request),q=z.object({limit:z.coerce.number().int().min(1).max(200).default(100)}).parse(request.query);return await listWalletTransactions(pool,uid,q.limit)}catch(e){return reply.code(401).send({error:String(e)})}});
 app.get('/v1/wallet/beneficiaries',async(request,reply)=>{try{return await listBeneficiaries(pool,userId(request))}catch(e){return reply.code(401).send({error:String(e)})}});
-
 app.post('/v1/wallet/deposits',async(request,reply)=>{const p=z.object({amountInr:z.number().positive().finite().max(10000000),idempotencyKey:z.string().min(16).max(128)}).safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_DEPOSIT',issues:p.error.issues});try{const uid=userId(request);if(!razorpay)throw unavailable('Razorpay');return reply.code(201).send(await createDeposit(pool,{userId:uid},p.data.amountInr,p.data.idempotencyKey,razorpay))}catch(e){return reply.code(503).send({error:'DEPOSIT_UNAVAILABLE',message:String(e)})}});
-
 app.post('/v1/wallet/beneficiaries',async(request,reply)=>{const p=z.object({name:z.string().min(3).max(50),email:z.string().email(),phone:z.string().regex(/^\d{10}$/),mode:z.enum(['UPI','IMPS','NEFT','RTGS']),vpa:z.string().regex(/^[^\s@]+@[^\s@]+$/).optional(),bankAccountNumber:z.string().min(6).max(30).optional(),ifsc:z.string().regex(/^[A-Z]{4}0[A-Z0-9]{6}$/).optional(),label:z.string().max(50).optional()}).superRefine((v,c)=>{if(v.mode==='UPI'&&!v.vpa)c.addIssue({code:'custom',path:['vpa'],message:'VPA is required for UPI'});if(v.mode!=='UPI'&&(!v.bankAccountNumber||!v.ifsc))c.addIssue({code:'custom',path:['bankAccountNumber'],message:'Bank account and IFSC are required'});}).safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_BENEFICIARY',issues:p.error.issues});try{const uid=userId(request);if(!razorpayConfig)throw unavailable('RazorpayX');const contact=await createBeneficiaryContact(razorpayConfig,{name:p.data.name,email:p.data.email,phone:p.data.phone,referenceId:uid});const contactId=String(contact.id);const fund=p.data.mode==='UPI'?await createBeneficiaryVpa(razorpayConfig,{contactId,vpa:p.data.vpa!}):await createBeneficiaryBank(razorpayConfig,{contactId,name:p.data.name,ifsc:p.data.ifsc!,accountNumber:p.data.bankAccountNumber!});const fundId=String(fund.id);const masked=p.data.mode==='UPI'?p.data.vpa!.replace(/(^.).*(@.*$)/,'$1***$2'):`${p.data.ifsc} ••••${p.data.bankAccountNumber!.slice(-4)}`;return reply.code(201).send(await saveBeneficiary(pool,uid,fundId,contactId,p.data.mode,masked,p.data.label))}catch(e){return reply.code(503).send({error:'BENEFICIARY_UNAVAILABLE',message:String(e)})}});
-
 app.post('/v1/wallet/withdrawals',async(request,reply)=>{const p=z.object({amountInr:z.number().positive().finite().max(10000000),fundAccountId:z.string().min(1),mode:z.enum(['UPI','IMPS','NEFT','RTGS']).default('UPI'),idempotencyKey:z.string().min(16).max(128)}).safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_WITHDRAWAL',issues:p.error.issues});try{const uid=userId(request);if(!razorpayConfig)throw unavailable('RazorpayX');const b=await pool.query(`SELECT 1 FROM withdrawal_beneficiaries WHERE user_id=$1 AND provider_fund_account_id=$2 AND status='ACTIVE'`,[uid,p.data.fundAccountId]);if(!b.rowCount)return reply.code(400).send({error:'BENEFICIARY_NOT_ACTIVE'});return reply.code(201).send(await createWithdrawal(pool,{userId:uid},p.data.amountInr,p.data.fundAccountId,p.data.mode,p.data.idempotencyKey,razorpayConfig))}catch(e){return reply.code(503).send({error:'WITHDRAWAL_UNAVAILABLE',message:String(e)})}});
+
+app.post('/v1/payments/stripe/intents',async(request,reply)=>{const p=createCardOrUpiPaymentSchema.safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_STRIPE_PAYMENT',issues:p.error.issues});try{if(!stripeConfig)throw unavailable('Stripe');const method=p.data.method==='STRIPE_CARD'?'card':'upi';if(method==='card'&&!stripeCardEnabled)throw unavailable('Stripe card');if(method==='upi'&&!stripeUpiEnabled)throw new Error('STRIPE_UPI_NOT_ENABLED_FOR_THIS_ACCOUNT');return reply.code(201).send(await createStripeWalletPayment(pool,userId(request),p.data.amountInr,method,p.data.idempotencyKey,stripeConfig))}catch(e){return reply.code(503).send({error:'STRIPE_UNAVAILABLE',message:String(e)})}});
+app.post('/v1/payments/stripe/crypto-intents',async(request,reply)=>{const p=createCryptoPaymentSchema.safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_CRYPTO_PAYMENT',issues:p.error.issues});try{if(!stripeConfig||!stripeCryptoEnabled)throw unavailable('Stripe crypto');if(!cryptoUsdInrRate||!Number.isFinite(cryptoUsdInrRate))throw new Error('CRYPTO_USD_INR_RATE_NOT_CONFIGURED');const targetInr=p.data.amountUsd*cryptoUsdInrRate;return reply.code(201).send(await createStripeCryptoWalletPayment(pool,userId(request),p.data.amountUsd,targetInr,p.data.asset,p.data.network,p.data.idempotencyKey,stripeConfig))}catch(e){return reply.code(503).send({error:'CRYPTO_UNAVAILABLE',message:String(e)})}});
+app.delete('/v1/payments/stripe/intents/:paymentId',async(request,reply)=>{const id=z.string().min(1).parse((request.params as {paymentId:string}).paymentId);try{if(!stripeConfig)throw unavailable('Stripe');await cancelStripePaymentIntent(stripeConfig,id);return reply.code(204).send()}catch(e){return reply.code(503).send({error:'STRIPE_UNAVAILABLE',message:String(e)})}});
+app.post('/v1/payments/upi/intents',async(request,reply)=>{const p=createPaymentIntentSchema.safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_PAYMENT',issues:p.error.issues});try{return reply.code(201).send(await upi.createPaymentIntent(p.data))}catch(e){return reply.code(503).send({error:'UPI_UNAVAILABLE',message:String(e)})}});
+app.delete('/v1/payments/upi/intents/:paymentId',async(request,reply)=>{const paymentId=z.string().min(1).parse((request.params as {paymentId:string}).paymentId);try{await upi.cancelPaymentIntent(paymentId);return reply.code(204).send()}catch(e){return reply.code(503).send({error:'UPI_UNAVAILABLE',message:String(e)})}});
 
 app.get('/v1/market/:exchange/:symbol/quote',async(request,reply)=>{const p=z.object({exchange:z.enum(['NSE','BSE']),symbol:z.string().min(1).max(30)}).parse(request.params);try{return await marketData.quote(p.symbol.toUpperCase(),p.exchange)}catch(e){return reply.code(503).send({error:'MARKET_DATA_UNAVAILABLE',message:String(e)})}});
 app.get('/v1/market/:exchange/:symbol/orderbook',async(request,reply)=>{const p=z.object({exchange:z.enum(['NSE','BSE']),symbol:z.string().min(1).max(30)}).parse(request.params);try{return await marketData.orderBook(p.symbol.toUpperCase(),p.exchange)}catch(e){return reply.code(503).send({error:'ORDERBOOK_UNAVAILABLE',message:String(e)})}});
@@ -89,7 +56,4 @@ app.post('/v1/orders',async(request,reply)=>{const p=createOrderRequestSchema.sa
 app.post('/v1/orders/tpsl',async(request,reply)=>{const p=createTpSlRequestSchema.safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_TPSL',issues:p.error.issues});try{return reply.code(201).send(await broker.placeTpSl(p.data))}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})}});
 app.patch('/v1/orders/:orderId',async(request,reply)=>{const orderId=z.string().min(1).parse((request.params as {orderId:string}).orderId);const p=createOrderRequestSchema.safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_ORDER',issues:p.error.issues});try{return reply.send(await broker.modifyOrder(orderId,p.data))}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})}});
 app.delete('/v1/orders/:orderId',async(request,reply)=>{const orderId=z.string().min(1).parse((request.params as {orderId:string}).orderId);try{await broker.cancelOrder(orderId);return reply.code(204).send()}catch(e){return reply.code(503).send({error:'EXECUTION_UNAVAILABLE',message:String(e)})}});
-app.post('/v1/payments/upi/intents',async(request,reply)=>{const p=createPaymentIntentSchema.safeParse(request.body);if(!p.success)return reply.code(400).send({error:'INVALID_PAYMENT',issues:p.error.issues});try{return reply.code(201).send(await upi.createPaymentIntent(p.data))}catch(e){return reply.code(503).send({error:'UPI_UNAVAILABLE',message:String(e)})}});
-app.delete('/v1/payments/upi/intents/:paymentId',async(request,reply)=>{const paymentId=z.string().min(1).parse((request.params as {paymentId:string}).paymentId);try{await upi.cancelPaymentIntent(paymentId);return reply.code(204).send()}catch(e){return reply.code(503).send({error:'UPI_UNAVAILABLE',message:String(e)})}});
-
 await app.listen({port:Number(process.env.PORT??3001),host:'0.0.0.0'});
