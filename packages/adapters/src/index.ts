@@ -1,6 +1,8 @@
 import type { BrokerAdapter, MarketDataAdapter, UpiAdapter } from '@inrliquid/domain';
 
 export type { BrokerAdapter, MarketDataAdapter, UpiAdapter } from '@inrliquid/domain';
+export { RazorpayUpiAdapter, createRazorpayPayout } from './razorpay.js';
+export type { RazorpayConfig, WithdrawalRequest } from './razorpay.js';
 
 export interface ProviderConfig {
   name: string;
