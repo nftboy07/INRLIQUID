@@ -20,7 +20,8 @@ COPY --from=build /app/packages/domain/package.json packages/domain/package.json
 COPY --from=build /app/packages/domain/dist packages/domain/dist
 COPY --from=build /app/packages/adapters/package.json packages/adapters/package.json
 COPY --from=build /app/packages/adapters/dist packages/adapters/dist
+COPY --from=build /app/infra/sql infra/sql
 RUN pnpm install --prod --frozen-lockfile
 USER node
 EXPOSE 3001
-CMD ["node","apps/api/dist/server.js"]
+CMD ["node","apps/api/dist/migrate.js"]
