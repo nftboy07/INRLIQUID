@@ -12,6 +12,12 @@ paths:
       responses:
         '200':
           description: Service is healthy
+  /v1/payments/providers:
+    get:
+      summary: Configured payment and execution rails
+      responses:
+        '200':
+          description: Booleans for Razorpay UPI collect/intent, Stripe card/UPI, and crypto
   /v1/market/{exchange}/{symbol}/quote:
     get:
       summary: Latest quote
@@ -35,9 +41,22 @@ paths:
         '201': {description: Order accepted by execution provider}
         '400': {description: Invalid order}
         '503': {description: Live execution unavailable}
+  /v1/wallet/deposits:
+    post:
+      summary: Create a Razorpay UPI deposit (collect by VPA, intent, or checkout link)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WalletDepositRequest'
+      responses:
+        '201': {description: Pending deposit created; wallet credit waits for webhook}
+        '400': {description: Invalid deposit}
+        '503': {description: Razorpay is not configured}
   /v1/payments/upi/intents:
     post:
-      summary: Create a UPI payment intent
+      summary: Create a ledger-backed UPI payment intent
       requestBody:
         required: true
         content:
@@ -48,6 +67,35 @@ paths:
         '201': {description: Payment intent created}
         '400': {description: Invalid payment request}
         '503': {description: UPI provider unavailable}
+  /v1/payments/upi/validate:
+    post:
+      summary: Validate a UPI ID (VPA) through Razorpay
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vpa]
+              properties:
+                vpa: {type: string, example: trader@oksbi}
+      responses:
+        '200': {description: Provider VPA validation result}
+        '400': {description: Invalid VPA}
+        '503': {description: UPI provider unavailable}
+  /v1/payments/stripe/intents:
+    post:
+      summary: Create a Stripe PaymentIntent for card or (flagged) UPI
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StripeIntentRequest'
+      responses:
+        '201': {description: PaymentIntent with client secret for Stripe Elements}
+        '400': {description: Invalid Stripe payment}
+        '503': {description: Stripe is not configured or the method is disabled}
 components:
   schemas:
     CreateOrderRequest:
@@ -61,10 +109,32 @@ components:
         orderType: {type: string, enum: [MARKET, LIMIT]}
         quantity: {type: number, exclusiveMinimum: 0}
         limitPriceInr: {type: number, exclusiveMinimum: 0}
+    WalletDepositRequest:
+      type: object
+      required: [amountInr, idempotencyKey]
+      properties:
+        amountInr: {type: number, exclusiveMinimum: 0, maximum: 10000000}
+        idempotencyKey: {type: string, minLength: 16, maxLength: 128}
+        flow: {type: string, enum: [collect, intent, link]}
+        vpa: {type: string, description: UPI ID required for collect, example: name@paytm}
+        app: {type: string, enum: [paytm, phonepe, gpay, other]}
+        customerEmail: {type: string, format: email}
+        customerContact: {type: string, pattern: '^[6-9]\d{9}$'}
     PaymentIntentRequest:
       type: object
       required: [amountInr, purpose, idempotencyKey]
       properties:
         amountInr: {type: number, exclusiveMinimum: 0}
-        purpose: {type: string, enum: [TRADING_FUNDING, SETTLEMENT]}
+        purpose: {type: string, enum: [TRADING_FUNDING, SETTLEMENT, FEES]}
+        idempotencyKey: {type: string, minLength: 16, maxLength: 128}
+        flow: {type: string, enum: [collect, intent, link]}
+        vpa: {type: string}
+        app: {type: string, enum: [paytm, phonepe, gpay, other]}
+    StripeIntentRequest:
+      type: object
+      required: [amountInr, method, idempotencyKey]
+      properties:
+        amountInr: {type: number, exclusiveMinimum: 0}
+        method: {type: string, enum: [STRIPE_CARD, STRIPE_UPI]}
+        purpose: {type: string, enum: [TRADING_FUNDING, SETTLEMENT, FEES]}
         idempotencyKey: {type: string, minLength: 16, maxLength: 128}

@@ -14,7 +14,9 @@ There is no paper trading, fake fill, simulated balance, or demo settlement path
 
 ## UPI payment hub
 
-The payment layer supports funding, settlement, withdrawal and fee intents through a provider adapter. Provider webhooks must be authenticated, idempotent and reconciled before any cash ledger entry is posted.
+The payment layer funds the wallet over Razorpay UPI (collect by UPI ID, intent into Paytm/PhonePe/Google Pay, or a checkout link) and Stripe card PaymentIntents. Provider webhooks must be authenticated, idempotent and reconciled before any cash ledger entry is posted. See `docs/PAYMENT_RAILS.md`.
+
+`GET /v1/payments/providers` reports which rails have credentials. Missing keys fail closed; there is no simulated balance credit.
 
 ## Repository layout
 
@@ -36,7 +38,7 @@ This repository is software infrastructure, not a claim of authorization to oper
 
 ## Development
 
-Requirements: Node.js 22+, pnpm 10+.
+Requirements: Node.js 22+, pnpm 10.x (`packageManager` is `pnpm@10.34.5`).
 
 ```bash
 pnpm install
