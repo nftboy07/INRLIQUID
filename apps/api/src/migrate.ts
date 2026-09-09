@@ -24,6 +24,7 @@ async function migrate() {
       applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
 
+        // Canonical migrations live in infra/sql. Draft schemas in infra/db and infra/legacy are not applied.
     const files = (await readdir(migrationsDir))
       .filter((name) => /^\d+_.*\.sql$/.test(name))
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));

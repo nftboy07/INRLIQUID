@@ -52,7 +52,7 @@ export async function reconcileUserOrders(pool: Pool, userId: string, limit = 50
     for (const trade of providerTrades) {
       const providerTradeId = tradeId(trade); const quantity = tradeQuantity(trade); const price = tradePrice(trade);
       if (!providerTradeId || quantity <= 0 || price <= 0) continue;
-      const inserted = await pool.query(`INSERT INTO trade_fills(id,order_id,provider_trade_id,quantity,price,fee,executed_at,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(order_id,provider_trade_id) DO NOTHING`, [randomUUID(), order.id, providerTradeId, quantity, price, Number(trade.fee ?? 0) || null, tradeTime(trade), JSON.stringify(trade)]);
+      const inserted = await pool.query(`INSERT INTO trade_fills(id,order_id,provider_trade_id,quantity,price,fee_paise,executed_at,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(order_id,provider_trade_id) DO NOTHING`, [randomUUID(), order.id, providerTradeId, quantity, price, Math.round((Number(trade.fee ?? 0) || 0) * 100), tradeTime(trade), JSON.stringify(trade)]);
       if (inserted.rowCount) fills += 1;
     }
   }

@@ -8,16 +8,19 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.15.0
+          version: 10.34.5
           run_install: false
-      - run: pnpm install --no-frozen-lockfile
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - name: Typecheck
         shell: bash
         run: |
@@ -33,5 +36,6 @@ jobs:
           path: typecheck.log
           if-no-files-found: ignore
       - run: pnpm test
+      - run: pnpm lint
       - run: pnpm build
       - run: docker build -f apps/api/Dockerfile .

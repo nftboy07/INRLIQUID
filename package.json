@@ -1,7 +1,14 @@
 {
   "name": "inrliquid",
   "private": true,
-  "packageManager": "pnpm@10.15.0",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=10.15.0 <11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
   "scripts": {
     "dev": "pnpm --parallel --filter @inrliquid/web --filter @inrliquid/api dev",
     "build": "pnpm -r build",
